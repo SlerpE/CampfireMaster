@@ -117,8 +117,6 @@ llm_with_tools = llm.bind_tools(tools)
 # ==========================================
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], operator.add]
-    screen_context: str
-    locator_context: str
     npc_context: str
     is_session_end: bool
     active_agents: List[str]  # Список агентов, которых разбудит Оркестратор
@@ -135,33 +133,14 @@ def agent_orchestrator(state: AgentState):
     response = llm.invoke([SystemMessage(content=PROMPTS['orchestrator']), state["messages"][-1]])
     decision = response.content.lower()
     
-    active = [name for name in ["screen", "locator", "npc"] if name in decision]
+    active = [name for name in ["npc"] if name in decision]
     if not active and not state.get("is_session_end"):
         active = []
 
     return {
         "active_agents": active,
-        "screen_context": "",
-        "locator_context": "",
         "npc_context": ""
     }
-
-def agent_screen(state: AgentState):
-    response = llm.invoke([SystemMessage(content=PROMPTS['screen'])] + state["messages"][-2:])
-    return {"screen_context": response.content}
-
-def agent_locator(state: AgentState):
-    db_text = "\n".join([f"[{row[0]}]: {row[1]}" for row in get_all("locations")])
-    prompt = PROMPTS['locator'].format(db_text=db_text)
-    response = llm.invoke([SystemMessage(content=prompt)] + state["messages"][-2:])
-    content = response.content
-    if "SAVE_LOC:" in content:
-        try:
-            data = content.split("SAVE_LOC:")[1].split("|", 1)
-            upsert_record("locations", data[0].strip(), data[1].strip())
-        except Exception as e:
-            print(f"Ошибка сохранения локации: {e}")
-    return {"locator_context": content}
 
 def agent_npc(state: AgentState):
     db_text = "\n".join([f"[{row[0]}]: {row[1]}" for row in get_all("npcs")])
@@ -178,8 +157,6 @@ def agent_npc(state: AgentState):
 
 def agent_master(state: AgentState):
     full_context = (
-        f"--- ОТЧЕТ ШИРМЫ ---\n{state.get('screen_context', 'Нет данных')}\n\n"
-        f"--- ДАННЫЕ ЛОКАЦИИ ---\n{state.get('locator_context', 'Нет данных')}\n\n"
         f"--- БИБЛИОТЕКА NPC ---\n{state.get('npc_context', 'Нет данных')}"
     )
     prompt = PROMPTS['master'].format(context=full_context)
@@ -213,8 +190,6 @@ def should_continue_from_master(state: AgentState):
 workflow = StateGraph(AgentState)
 
 workflow.add_node("orchestrator", agent_orchestrator)
-workflow.add_node("screen", agent_screen)
-workflow.add_node("locator", agent_locator)
 workflow.add_node("npc", agent_npc)
 workflow.add_node("master", agent_master)
 workflow.add_node("tools", ToolNode(tools))
@@ -226,12 +201,10 @@ workflow.set_entry_point("orchestrator")
 workflow.add_conditional_edges(
     "orchestrator",
     route_from_orchestrator,
-    ["screen", "locator", "npc", "master", "summarizer"]
+    ["npc", "master", "summarizer"]
 )
 
 # СХОЖДЕНИЕ (Fan-in): Все параллельные агенты после работы сливаются в Мастера
-workflow.add_edge("screen", "master")
-workflow.add_edge("locator", "master")
 workflow.add_edge("npc", "master")
 
 # ЛОГИКА МАСТЕРА: Либо конец хода, либо вызов Python (кубики)
@@ -272,7 +245,7 @@ def main():
 
     state: AgentState = {
         "messages": [SystemMessage(content=past_history)] if past_history else [],
-        "screen_context": "", "locator_context": "", "npc_context": "",
+        "npc_context": "",
         "is_session_end": False, "active_agents": []
     }
 
@@ -307,7 +280,7 @@ def main():
                         if agents:
                             console.print(f"[dim grey]└─ вызваны: {', '.join(agents)}[/dim grey]")
                     
-                    elif node_name in ["screen", "locator", "npc"]:
+                    elif node_name == "npc":
                         console.print(f"[dim yellow]✓ {node_name.capitalize()} готов[/dim yellow]")
                         
                     elif node_name == "tools":
