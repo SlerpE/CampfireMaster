@@ -116,26 +116,45 @@ class AgentState(TypedDict):
 # ==========================================
 
 def agent_orchestrator(state: AgentState):
-    """Оркестратор решает, какие агенты нужны для обработки запроса."""
+    """
+    ИИ-Оркестратор: распределяет задачи на основе расширенных ролей агентов.
+    """
     if state.get("is_session_end"):
         return {"active_agents": ["summarizer"]}
         
-    sys_prompt = SystemMessage(content="""Ты ИИ-Оркестратор. Твоя задача определить, какие модули нужны для ответа.
-    Модули:
-    - screen : нужны скрытые броски кубиков за кадром, планирование угрозы.
-    - locator : игрок перемещается в новую локацию, осматривает местность.
-    - npc : игрок говорит с персонажем, просит создать персонажа, упоминает живых существ.
-    Выведи ТОЛЬКО названия нужных модулей. Пример: npc, screen""")
+    sys_prompt = SystemMessage(content="""Ты Главный Координатор TTRPG-системы.
+Твоя задача — проанализировать запрос игрока и вызвать нужных узкоспециализированных агентов.
+
+Кого вызывать:
+1. 'screen' (Агент-Ширма): Вызывай ПРАКТИЧЕСКИ ВСЕГДА, если происходит активное действие, требующее скрытых планов, скрытых размышлений, проверок навыков или реакции мира "за кадром".
+2. 'locator' (Агент-Локатор): Вызывай, если игрок:
+   - Входит в новую локацию или осматривает текущую.
+   - Спрашивает про архитектуру, расположение объектов или историю места.
+   - Пытается найти выход или пространственно переместиться.
+3. 'npc' (Агент-Менеджер NPC): Вызывай, если игрок:
+   - Обращается к кому-то или упоминает имя персонажа.
+   - Требует статблок, инвентарь или описание внешности/личности (MBTI).
+   - Взаимодействует со статусом, фракциями или имуществом NPC.
+
+Выведи только список нужных агентов через запятую.
+Пример: screen, npc
+Или: locator
+""")
     
+    # Даем оркестратору последнее сообщение игрока
     response = llm.invoke([sys_prompt, state["messages"][-1]])
-    content = response.content.lower()
+    decision = response.content.lower()
     
     active = []
-    if "screen" in content: active.append("screen")
-    if "locator" in content: active.append("locator")
-    if "npc" in content: active.append("npc")
+    if "screen" in decision: active.append("screen")
+    if "locator" in decision: active.append("locator")
+    if "npc" in decision: active.append("npc")
     
-    # Сбрасываем старые контексты и передаем список тех, кого надо запустить параллельно
+    # Если оркестратор затупил и ничего не выбрал — по дефолту идем к Мастеру
+    if not active and not state.get("is_session_end"):
+        active = []
+
+    # Очищаем контексты перед новым циклом, чтобы не было галлюцинаций из прошлых сцен
     return {
         "active_agents": active,
         "screen_context": "",
@@ -144,50 +163,94 @@ def agent_orchestrator(state: AgentState):
     }
 
 def agent_screen(state: AgentState):
-    sys_prompt = SystemMessage(content="Ты Агент-Ширма. Напиши коротко свои скрытые мысли, планы на угрозу или проверки навыков.")
+    sys_prompt = SystemMessage(content="""Ты Агент-Ширма (Game Master Brain).
+Твоя задача: работать как скрытый "Хайден стейт" за ширмой.
+Планируй действия, которые происходят вне поля зрения игроков:
+- Продумывай засады, реакции фракций, скрытые перемещения мобов.
+- Генерируй скрытые проверки (например, броски на восприятие или скрытность врагов).
+- Анализируй мотивы NPC за кадром.
+Напиши короткий, но емкий план скрытых событий для текущего хода.""")
     response = llm.invoke([sys_prompt] + state["messages"][-2:])
     return {"screen_context": response.content}
 
 def agent_locator(state: AgentState):
     locs = get_all("locations")
     db_text = "\n".join([f"[{row[0]}]: {row[1]}" for row in locs])
-    sys_prompt = SystemMessage(content=f"""Ты Агент-Локатор. База локаций:\n{db_text}\nЕСЛИ СОЗДАЕШЬ/МЕНЯЕШЬ ЛОКАЦИЮ, начни ответ с: SAVE_LOC: Имя | Описание""")
+    sys_prompt = SystemMessage(content=f"""Ты Агент-Локатор.
+Твоя задача: управлять пространством игры. Ищи локацию в базе. Если она есть — выдай инфу. Если нет или игрок открывает новую зону — инициализируй её.
+В инициализации локации обязательно продумай:
+1. Пространственное расположение (что где находится, выходы, уровни).
+2. Детальный внешний вид, архитектуру, атмосферу.
+3. Полный лор локации (история, кто тут жил/живет, секреты).
+
+Текущая база:
+{db_text}
+
+ЕСЛИ ТЫ СОЗДАЕШЬ НОВУЮ ИЛИ ОБНОВЛЯЕШЬ СТАРУЮ ЛОКАЦИЮ (добавились разрушения, новые постройки), строго начни ответ:
+SAVE_LOC: Имя Локации | [Здесь подробный текст: Пространство, Внешний вид, Лор, Расположение объектов]
+Иначе просто выдай инфу для Мастера.""")
     response = llm.invoke([sys_prompt] + state["messages"][-2:])
     content = response.content
     if "SAVE_LOC:" in content:
         try:
             parts = content.split("SAVE_LOC:")[1].split("|", 1)
             upsert_record("locations", parts[0].strip(), parts[1].strip())
-            content = f"Локация {parts[0].strip()} сохранена. {parts[1].strip()}"
+            content = f"Локация {parts[0].strip()} инициализирована/изменена. {parts[1].strip()}"
         except: pass
     return {"locator_context": content}
 
 def agent_npc(state: AgentState):
     npcs = get_all("npcs")
     db_text = "\n".join([f"[{row[0]}]: {row[1]}" for row in npcs])
-    sys_prompt = SystemMessage(content=f"""Ты Агент-Менеджер NPC. База NPC:\n{db_text}\nЕСЛИ СОЗДАЕШЬ/МЕНЯЕШЬ NPC, начни ответ с: SAVE_NPC: Имя | Описание, mbti, лор""")
+    sys_prompt = SystemMessage(content=f"""Ты Агент-Менеджер NPC. У нас есть библиотека NPC.
+Твоя задача: когда игроки вступают в диалог/взаимодействие, проверяй базу. Если NPC есть — подтягивай. Если нет — инициализируй с нуля. Ты также можешь менять/редактировать NPC, если в ходе игры он получил ранение, потерял/нашел лут или повысил статус.
+
+При инициализации или обновлении NPC ты должен сформировать полную карточку личности (как в тавернах):
+1. Лор персонажа полный (предыстория, цели, страхи).
+2. Карточка личности: MBTI, характер, манера речи.
+3. Статус в обществе, звания, принадлежность к фракциям.
+4. Владения (дома, участки, бизнес, если есть).
+5. Текущее состояние (здоров, ранен, пьян, зол).
+6. Инвентарь (что в карманах, оружие).
+7. Статблок (характеристики, навыки для боя/проверок).
+
+Текущая база NPC:
+{db_text}
+
+ЕСЛИ ТЫ ИНИЦИАЛИЗИРУЕШЬ ИЛИ РЕДАКТИРУЕШЬ NPC, строго начни свой ответ с:
+SAVE_NPC: Имя Персонажа | [Здесь полная анкета: Состояние, Инвентарь, Владения, Звания, Статус, Лор, Статблок, Личность/MBTI]
+Иначе просто выдай инфу о нем Мастеру.""")
     response = llm.invoke([sys_prompt] + state["messages"][-2:])
     content = response.content
     if "SAVE_NPC:" in content:
         try:
             parts = content.split("SAVE_NPC:")[1].split("|", 1)
             upsert_record("npcs", parts[0].strip(), parts[1].strip())
-            content = f"NPC {parts[0].strip()} сохранен. {parts[1].strip()}"
+            content = f"NPC {parts[0].strip()} инициализирован/обновлен. {parts[1].strip()}"
         except: pass
     return {"npc_context": content}
 
 def agent_master(state: AgentState):
     context = f"""
-    [Ширма]: {state.get('screen_context', '')}
-    [Локация]: {state.get('locator_context', '')}
-    [NPC]: {state.get('npc_context', '')}
+    [Скрытые мысли Ширмы]: {state.get('screen_context', '')}
+    [Информация от Локатора]: {state.get('locator_context', '')}
+    [Информация от Менеджера NPC]: {state.get('npc_context', '')}
     """
-    sys_prompt = SystemMessage(content=f"Ты Агент-Мастер (DM). Веди игру, используя контекст от параллельных модулей:\n{context}\nПри необходимости бросай кубики через python_interpreter.")
+    sys_prompt = SystemMessage(content=f"""Ты Агент-Мастер (Главный DM).
+Твоя задача: вести игру, красиво описывать мир и реагировать на действия игроков.
+Используй подробный контекст от других агентов (локации, статблоки NPC, скрытые угрозы от Ширмы) для формирования сцены:
+{context}
+
+При необходимости математики или бросков кубиков (учитывая статблоки от NPC-менеджера) вызывай инструмент python_interpreter.""")
     response = llm_with_tools.invoke([sys_prompt] + state["messages"])
     return {"messages": [response]}
 
 def agent_summarizer(state: AgentState):
-    sys_prompt = SystemMessage(content="Ты Агент-Итогер. Сделай саммари сессии и распредели XP.")
+    sys_prompt = SystemMessage(content="""Ты Агент-Итогер.
+Игровая сессия подошла к концу. Твоя задача:
+1. Сделать максимально подробное саммари всего происходящего в данной сессии (сюжет, диалоги, битвы, важные решения).
+2. Подсчитать и сообщить, кто из персонажей и сколько опыта (XP) получил за эту партию, исходя из их достижений и убитых врагов/пройденных социалок.
+Этот текст будет сохранен в БД и подтянется в следующую сессию.""")
     response = llm.invoke([sys_prompt] + state["messages"])
     save_summary(response.content)
     return {"messages": [AIMessage(content=f"\n*** ИТОГИ СЕССИИ ***\n{response.content}")]}
@@ -223,16 +286,35 @@ workflow.add_node("summarizer", agent_summarizer)
 
 workflow.set_entry_point("orchestrator")
 
-# Из оркестратора возможны параллельные переходы
-workflow.add_conditional_edges("orchestrator", route_from_orchestrator, ["screen", "locator", "npc", "master", "summarizer"])
+# МАРШРУТИЗАЦИЯ ИЗ ОРКЕСТРАТОРА
+workflow.add_conditional_edges(
+    "orchestrator",
+    route_from_orchestrator,
+    {
+        "screen": "screen",
+        "locator": "locator",
+        "npc": "npc",
+        "master": "master",
+        "summarizer": "summarizer"
+    }
+)
 
-# Все вспомогательные агенты после параллельной работы сходятся в Мастера (Fan-in)
+# СХОЖДЕНИЕ (Fan-in): Все параллельные агенты после работы сливаются в Мастера
 workflow.add_edge("screen", "master")
 workflow.add_edge("locator", "master")
 workflow.add_edge("npc", "master")
 
-# Условный переход от Мастера (тулзы или конец)
-workflow.add_conditional_edges("master", should_continue_from_master, ["tools", END])
+# ЛОГИКА МАСТЕРА: Либо конец хода, либо вызов Python (кубики)
+workflow.add_conditional_edges(
+    "master",
+    should_continue_from_master,
+    {
+        "tools": "tools",
+        "end": END
+    }
+)
+
+# Возврат из инструментов снова к Мастеру (чтобы он озвучил результат броска)
 workflow.add_edge("tools", "master")
 workflow.add_edge("summarizer", END)
 
