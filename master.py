@@ -1,6 +1,7 @@
 import os
 import sqlite3
-from typing import Annotated, TypedDict, Sequence
+import operator
+from typing import Annotated, TypedDict, Sequence, List
 from rich.console import Console
 from rich.panel import Panel
 from rich.markdown import Markdown
@@ -12,7 +13,6 @@ from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, System
 from langchain_core.tools import tool
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
-import operator
 
 # ==========================================
 # 1. НАСТРОЙКА ИНТЕРФЕЙСА (RICH)
@@ -32,40 +32,16 @@ console = Console(theme=custom_theme)
 DB_FILE = "ttrpg_database.db"
 
 def init_db():
-    """Создает таблицы, если их нет"""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    
-    # Таблица NPC
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS npcs (
-            name TEXT PRIMARY KEY,
-            lore_and_stats TEXT
-        )
-    ''')
-    
-    # Таблица Локаций
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS locations (
-            name TEXT PRIMARY KEY,
-            description TEXT
-        )
-    ''')
-    
-    # Таблица Саммари сессий
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS summaries (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            content TEXT
-        )
-    ''')
-    
+    cursor.execute('CREATE TABLE IF NOT EXISTS npcs (name TEXT PRIMARY KEY, lore_and_stats TEXT)')
+    cursor.execute('CREATE TABLE IF NOT EXISTS locations (name TEXT PRIMARY KEY, description TEXT)')
+    cursor.execute('CREATE TABLE IF NOT EXISTS summaries (id INTEGER PRIMARY KEY AUTOINCREMENT, content TEXT)')
     conn.commit()
     conn.close()
 
 init_db()
 
-# Вспомогательные функции для работы с БД
 def get_all(table_name):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
@@ -75,7 +51,6 @@ def get_all(table_name):
     return rows
 
 def upsert_record(table_name, name, content):
-    """Обновляет или вставляет новую запись (NPC/Локацию)"""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     if table_name == "npcs":
@@ -108,13 +83,7 @@ llm = ChatOpenAI(
 # ==========================================
 @tool
 def python_interpreter(code: str) -> str:
-    """
-    Выполняет Python код. Используй для математики и бросков кубиков.
-    Возвращай результат через print().
-    Пример:
-    import random
-    print(random.randint(1, 20))
-    """
+    """Выполняет Python код. Используй для математики и бросков кубиков."""
     import sys
     from io import StringIO
     old_stdout = sys.stdout
@@ -140,99 +109,102 @@ class AgentState(TypedDict):
     locator_context: str
     npc_context: str
     is_session_end: bool
+    active_agents: List[str]  # Список агентов, которых разбудит Оркестратор
 
 # ==========================================
 # 6. УЗЛЫ (АГЕНТЫ)
 # ==========================================
 
+def agent_orchestrator(state: AgentState):
+    """Оркестратор решает, какие агенты нужны для обработки запроса."""
+    if state.get("is_session_end"):
+        return {"active_agents": ["summarizer"]}
+        
+    sys_prompt = SystemMessage(content="""Ты ИИ-Оркестратор. Твоя задача определить, какие модули нужны для ответа.
+    Модули:
+    - screen : нужны скрытые броски кубиков за кадром, планирование угрозы.
+    - locator : игрок перемещается в новую локацию, осматривает местность.
+    - npc : игрок говорит с персонажем, просит создать персонажа, упоминает живых существ.
+    Выведи ТОЛЬКО названия нужных модулей. Пример: npc, screen""")
+    
+    response = llm.invoke([sys_prompt, state["messages"][-1]])
+    content = response.content.lower()
+    
+    active = []
+    if "screen" in content: active.append("screen")
+    if "locator" in content: active.append("locator")
+    if "npc" in content: active.append("npc")
+    
+    # Сбрасываем старые контексты и передаем список тех, кого надо запустить параллельно
+    return {
+        "active_agents": active,
+        "screen_context": "",
+        "locator_context": "",
+        "npc_context": ""
+    }
+
 def agent_screen(state: AgentState):
-    sys_prompt = SystemMessage(content="Ты Агент-Ширма. Скрыто планируешь действия за кадром, оцениваешь проверки навыков и угрозы. Напиши свои мысли коротко.")
+    sys_prompt = SystemMessage(content="Ты Агент-Ширма. Напиши коротко свои скрытые мысли, планы на угрозу или проверки навыков.")
     response = llm.invoke([sys_prompt] + state["messages"][-2:])
     return {"screen_context": response.content}
 
 def agent_locator(state: AgentState):
-    # Достаем все локации из SQLite
     locs = get_all("locations")
     db_text = "\n".join([f"[{row[0]}]: {row[1]}" for row in locs])
-    
-    sys_prompt = SystemMessage(content=f"""Ты Агент-Локатор. 
-База локаций:\n{db_text}
-
-Анализируй действия игрока. Если он в новой локации - придумай её (лор, вид). 
-ЕСЛИ ТЫ СОЗДАЕШЬ ИЛИ МЕНЯЕШЬ ЛОКАЦИЮ, строго начни свой ответ с:
-SAVE_LOC: Имя Локации | Описание
-Иначе просто опиши текущую.""")
-    
+    sys_prompt = SystemMessage(content=f"""Ты Агент-Локатор. База локаций:\n{db_text}\nЕСЛИ СОЗДАЕШЬ/МЕНЯЕШЬ ЛОКАЦИЮ, начни ответ с: SAVE_LOC: Имя | Описание""")
     response = llm.invoke([sys_prompt] + state["messages"][-2:])
     content = response.content
-    
-    # Парсим маркер для записи в SQLite
     if "SAVE_LOC:" in content:
         try:
             parts = content.split("SAVE_LOC:")[1].split("|", 1)
-            loc_name = parts[0].strip()
-            loc_desc = parts[1].strip()
-            upsert_record("locations", loc_name, loc_desc)
-            content = f"Локация {loc_name} загружена/обновлена в БД. {loc_desc}"
-        except Exception:
-            pass
-            
+            upsert_record("locations", parts[0].strip(), parts[1].strip())
+            content = f"Локация {parts[0].strip()} сохранена. {parts[1].strip()}"
+        except: pass
     return {"locator_context": content}
 
 def agent_npc(state: AgentState):
-    # Достаем всех NPC из SQLite
     npcs = get_all("npcs")
     db_text = "\n".join([f"[{row[0]}]: {row[1]}" for row in npcs])
-    
-    sys_prompt = SystemMessage(content=f"""Ты Агент-Менеджер NPC.
-База NPC:\n{db_text}
-
-Если игрок обращается к новому NPC, инициализируй его (статблок, инвентарь, mbti, лор).
-ЕСЛИ ТЫ СОЗДАЕШЬ ИЛИ ИЗМЕНЯЕШЬ NPC, строго начни свой ответ с:
-SAVE_NPC: Имя Персонажа | Полное описание и статы
-Иначе просто выдай инфу.""")
-    
+    sys_prompt = SystemMessage(content=f"""Ты Агент-Менеджер NPC. База NPC:\n{db_text}\nЕСЛИ СОЗДАЕШЬ/МЕНЯЕШЬ NPC, начни ответ с: SAVE_NPC: Имя | Описание, mbti, лор""")
     response = llm.invoke([sys_prompt] + state["messages"][-2:])
     content = response.content
-    
-    # Парсим маркер для записи в SQLite
     if "SAVE_NPC:" in content:
         try:
             parts = content.split("SAVE_NPC:")[1].split("|", 1)
-            npc_name = parts[0].strip()
-            npc_lore = parts[1].strip()
-            upsert_record("npcs", npc_name, npc_lore)
-            content = f"NPC {npc_name} загружен/обновлен в БД. {npc_lore}"
-        except Exception:
-            pass
-
+            upsert_record("npcs", parts[0].strip(), parts[1].strip())
+            content = f"NPC {parts[0].strip()} сохранен. {parts[1].strip()}"
+        except: pass
     return {"npc_context": content}
 
 def agent_master(state: AgentState):
     context = f"""
-    [Скрытые мысли Ширмы]: {state.get('screen_context', '')}
-    [Данные о Локации]: {state.get('locator_context', '')}
-    [Данные о NPC]: {state.get('npc_context', '')}
+    [Ширма]: {state.get('screen_context', '')}
+    [Локация]: {state.get('locator_context', '')}
+    [NPC]: {state.get('npc_context', '')}
     """
-    sys_prompt = SystemMessage(content=f"Ты Агент-Мастер (DM). Веди игру на основе контекста от модулей:\n{context}\nПри необходимости бросай кубики через python_interpreter.")
-    
+    sys_prompt = SystemMessage(content=f"Ты Агент-Мастер (DM). Веди игру, используя контекст от параллельных модулей:\n{context}\nПри необходимости бросай кубики через python_interpreter.")
     response = llm_with_tools.invoke([sys_prompt] + state["messages"])
     return {"messages": [response]}
 
 def agent_summarizer(state: AgentState):
     sys_prompt = SystemMessage(content="Ты Агент-Итогер. Сделай саммари сессии и распредели XP.")
     response = llm.invoke([sys_prompt] + state["messages"])
-    
-    # Сохраняем в SQLite
     save_summary(response.content)
-    
     return {"messages": [AIMessage(content=f"\n*** ИТОГИ СЕССИИ ***\n{response.content}")]}
 
-def should_continue(state: AgentState):
-    last_message = state["messages"][-1]
+# Роутеры
+def route_from_orchestrator(state: AgentState):
+    """Маршрутизатор из оркестратора. Запускает нужные узлы ПАРАЛЛЕЛЬНО."""
+    agents = state.get("active_agents", [])
     if state.get("is_session_end"):
-        return "summarizer"
-    elif last_message.tool_calls:
+        return ["summarizer"]
+    if not agents:
+        return ["master"] # Если никто не нужен, идем напрямую к Мастеру
+    return agents # Возврат списка узлов запускает их в параллельных потоках
+
+def should_continue_from_master(state: AgentState):
+    last_message = state["messages"][-1]
+    if last_message.tool_calls:
         return "tools"
     return END
 
@@ -241,6 +213,7 @@ def should_continue(state: AgentState):
 # ==========================================
 workflow = StateGraph(AgentState)
 
+workflow.add_node("orchestrator", agent_orchestrator)
 workflow.add_node("screen", agent_screen)
 workflow.add_node("locator", agent_locator)
 workflow.add_node("npc", agent_npc)
@@ -248,11 +221,18 @@ workflow.add_node("master", agent_master)
 workflow.add_node("tools", ToolNode(tools))
 workflow.add_node("summarizer", agent_summarizer)
 
-workflow.set_entry_point("screen")
-workflow.add_edge("screen", "locator")
-workflow.add_edge("locator", "npc")
+workflow.set_entry_point("orchestrator")
+
+# Из оркестратора возможны параллельные переходы
+workflow.add_conditional_edges("orchestrator", route_from_orchestrator, ["screen", "locator", "npc", "master", "summarizer"])
+
+# Все вспомогательные агенты после параллельной работы сходятся в Мастера (Fan-in)
+workflow.add_edge("screen", "master")
+workflow.add_edge("locator", "master")
 workflow.add_edge("npc", "master")
-workflow.add_conditional_edges("master", should_continue, ["tools", "summarizer", END])
+
+# Условный переход от Мастера (тулзы или конец)
+workflow.add_conditional_edges("master", should_continue_from_master, ["tools", END])
 workflow.add_edge("tools", "master")
 workflow.add_edge("summarizer", END)
 
@@ -261,73 +241,49 @@ app = workflow.compile()
 # ==========================================
 # 8. UI И ГЛАВНЫЙ ЦИКЛ
 # ==========================================
-def print_banner():
-    console.clear()
-    banner = Markdown("""
-# 🐉 TTRPG AI Game Master
-### LangGraph + Gemma-4 + SQLite + Rich
-* Введите действие для игры.
-* `/end` - завершить сессию и записать саммари в БД.
-* `/quit` - выход.
-    """)
-    console.print(Panel(banner, style="master", border_style="bold yellow"))
-
-def load_previous_summaries():
-    summaries = get_all("summaries")
-    if not summaries:
-        return ""
-    text = "История предыдущих сессий:\n"
-    for row in summaries:
-        text += f"--- Сессия {row[0]} ---\n{row[1]}\n"
-    return text
-
 def main():
-    print_banner()
+    console.clear()
+    console.print(Panel("[bold green]🐉 TTRPG AI Game Master (Parallel Routing Edition)[/bold green]\n* `/end` - итоги\n* `/quit` - выход", style="master"))
     
-    past_history = load_previous_summaries()
-    initial_context = ""
-    if past_history:
-        console.print(Panel("Загружены итоги из SQLite. Мастер помнит прошлое.", style="info"))
-        initial_context = f"Учти события прошлых сессий:\n{past_history}"
+    past_history = ""
+    summaries = get_all("summaries")
+    if summaries:
+        past_history = "История прошлых сессий:\n" + "\n".join([f"- Сессия {r[0]}: {r[1]}" for r in summaries])
+        console.print("[info]База подтянута. Мастер помнит прошлые игры.[/info]")
 
     state: AgentState = {
-        "messages": [SystemMessage(content=initial_context)] if initial_context else [],
-        "screen_context": "",
-        "locator_context": "",
-        "npc_context": "",
-        "is_session_end": False
+        "messages": [SystemMessage(content=past_history)] if past_history else [],
+        "screen_context": "", "locator_context": "", "npc_context": "",
+        "is_session_end": False, "active_agents": []
     }
 
     while True:
         user_input = Prompt.ask("\n[bold cyan]Вы (Игрок)[/bold cyan]")
-        
-        if user_input.strip() == "/quit":
-            console.print("[danger]Выход...[/danger]")
-            break
-            
+        if user_input.strip() == "/quit": break
         if user_input.strip() == "/end":
             state["is_session_end"] = True
             user_input = "СЕССИЯ ОКОНЧЕНА. Подведи итоги."
             
         state["messages"].append(HumanMessage(content=user_input))
 
-        with console.status("[bold magenta]Агенты шуршат в SQLite...[/bold magenta]", spinner="dots") as status:
+        with console.status("[bold magenta]Оркестратор анализирует запрос...[/bold magenta]", spinner="dots") as status:
             for output in app.stream(state):
                 for node_name, node_state in output.items():
-                    if node_name == "screen":
-                        status.update("[bold magenta]Ширма бросает кубы за кадром...[/bold magenta]")
-                    elif node_name == "locator":
-                        status.update("[bold blue]Локатор проверяет БД локаций...[/bold blue]")
-                    elif node_name == "npc":
-                        status.update("[bold yellow]Менеджер NPC обращается к БД...[/bold yellow]")
+                    if node_name == "orchestrator":
+                        agents = node_state.get("active_agents", [])
+                        msg = f"Оркестратор разбудил: {', '.join(agents)}" if agents else "Никто не нужен, сразу к Мастеру"
+                        console.print(f"[dim info]⚙️ {msg}[/dim info]")
+                        status.update("[bold magenta]Агенты шуршат параллельно...[/bold magenta]")
+                        
+                    elif node_name in ["screen", "locator", "npc"]:
+                        console.print(f"[dim yellow]✓ {node_name.capitalize()} отработал(а)[/dim yellow]")
+                        
                     elif node_name == "tools":
                         status.update("[bold red]Мастер кодит на Python...[/bold red]")
-                        last_msg = node_state["messages"][-1]
-                        console.print(f"[bold red]⚙️ Python Output:[/bold red]\n{last_msg.content}")
-                    elif node_name == "summarizer":
-                        status.update("[bold green]Итогер пишет летопись в БД...[/bold green]")
+                        console.print(f"[bold red]⚙️ Python Output:[/bold red]\n{node_state['messages'][-1].content}")
+                        
                     elif node_name == "master":
-                        status.update("[bold green]Мастер формулирует ответ...[/bold green]")
+                        status.update("[bold green]Мастер пишет ответ...[/bold green]")
 
             last_msg = output[list(output.keys())[-1]]["messages"][-1]
             state["messages"].append(last_msg)
